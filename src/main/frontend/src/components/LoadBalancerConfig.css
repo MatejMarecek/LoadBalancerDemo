@@ -1,0 +1,8 @@
+.LoadBalancerConfig-from-section-header {
+  margin-top: 1em;
+}
+
+.LoadBalancerConfig-from-section-description {
+  color: darkslategray;
+  font-style: italic;
+}
