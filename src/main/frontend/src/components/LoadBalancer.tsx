@@ -55,9 +55,11 @@ export class LoadBalancer extends React.Component<LoadBalancerProps, LoadBalance
             <Jumbotron>
               <h1>Load Balancer</h1>
               <p>
-                This is an application that demonstrates behavior and usage of Load Balancer.
-                It servers as a front-end for the server running the balancer service.
-                You can configure the balancer in the Configuration tab.
+                This is an application that demonstrates a behavior and usage of a Load Balancer.
+                It serves as a front-end for a server running the balancer service.
+                You can configure the balancer in the Configuration tab. The options include the scheduling
+                algorithm (random/round-robin), simulated delays of the GET call and failure rate
+                for Providers.
               </p>
               <p>
                 Click the <Badge variant="primary">GET</Badge> button to call the server.
