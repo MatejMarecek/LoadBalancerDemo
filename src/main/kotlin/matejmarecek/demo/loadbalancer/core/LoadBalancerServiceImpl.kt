@@ -1,11 +1,13 @@
 package matejmarecek.demo.loadbalancer.core
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import matejmarecek.demo.loadbalancer.config.LoadBalancerConfig
 import matejmarecek.demo.loadbalancer.config.provider.DefaultProviderConfig
 import matejmarecek.demo.loadbalancer.provider.DefaultProvider
 import matejmarecek.demo.loadbalancer.provider.Provider
-import kotlinx.coroutines.async
-import kotlinx.coroutines.runBlocking
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
@@ -32,7 +34,7 @@ class LoadBalancerServiceImpl @Autowired constructor(private val config: LoadBal
         get() = config.algorithm
 
 
-    private val nonLiveProvidersSync = Object()
+    private val providersMutex = Mutex()
     private val liveProviders: MutableList<Provider> = (1..config.initNumbOfProviders)
             .map { DefaultProvider(defaultProviderConfig) }
             .toMutableList()
@@ -107,22 +109,22 @@ class LoadBalancerServiceImpl @Autowired constructor(private val config: LoadBal
     // --- Provider health check ---
     // -----------------------------
     private fun runCheck() = runBlocking {
-        val timeout = config.heartBeatCheckTimeoutSec * 1000L
-        val providersCopy = synchronized(liveProviders) { liveProviders.toList() }
+        providersMutex.withLock {
+            val timeout = config.heartBeatCheckTimeoutSec * 1000L
+            val providersCopy = synchronized(liveProviders) { liveProviders.toList() }
 
-        val deferredInUseCheck = async { providersCopy.check(timeout) }
-        val deferredBrokenCheck = async { brokenProviders.check(timeout) }
-        val deferredRecoveredCheck = async { recoveredProviders.check(timeout) }
+            val deferredInUseCheck = async { providersCopy.check(timeout) }
+            val deferredBrokenCheck = async { brokenProviders.check(timeout) }
+            val deferredRecoveredCheck = async { recoveredProviders.check(timeout) }
 
-        val inUseCheck = deferredInUseCheck.await()
-        val brokenCheck = deferredBrokenCheck.await()
-        val recoveredCheck = deferredRecoveredCheck.await()
+            val inUseCheck = deferredInUseCheck.await()
+            val brokenCheck = deferredBrokenCheck.await()
+            val recoveredCheck = deferredRecoveredCheck.await()
 
-        synchronized(nonLiveProvidersSync) {
             brokenProviders = inUseCheck.getBroken() + brokenCheck.getBroken() + recoveredCheck.getBroken()
             recoveredProviders = brokenCheck.getHealthy()
 
-            val notIncluded = excludeIncludeProviders(inUseCheck.getBroken(), recoveredCheck.getHealthy())
+            val notIncluded = excludeIncludeLiveProviders(inUseCheck.getBroken(), recoveredCheck.getHealthy())
             if (notIncluded.isNotEmpty()) {
                 logger.warn("Not enough space to include recovered Providers: ${notIncluded.joinToString(", ") { it.id }}")
                 recoveredProviders = recoveredProviders + notIncluded
@@ -137,25 +139,31 @@ class LoadBalancerServiceImpl @Autowired constructor(private val config: LoadBal
      * @param [toInclude] providers to be included form the list of Live Providers
      * @return list of providers that could not have been included. Most likely because of capacity issues
      */
-    private fun excludeIncludeProviders(toExclude: List<Provider>, toInclude: List<Provider>): List<Provider> {
+    private fun excludeIncludeLiveProviders(toExclude: List<Provider>, toInclude: List<Provider>): List<Provider> {
         synchronized(liveProviders) {
             toExclude.forEach { excludeProviderFromLive(it) }
 
             data class IncludeOp(val provider: Provider, val result: IncludeResult)
 
-            return toInclude.map { IncludeOp(it, includeProvider(it)) }
+            return toInclude.map { IncludeOp(it, includeProviderRaw(it)) }
                     .filter { it.result != IncludeResult.INCLUDED }
                     .map { it.provider }
         }
     }
 
-    fun excludeProviderFromLive(provider: Provider): Boolean {
+    private fun excludeProviderFromLive(provider: Provider): Boolean {
         return synchronized(liveProviders) {
             liveProviders.removeIf { p -> p.id == provider.id }
         }
     }
 
-    override fun includeProvider(provider: Provider): IncludeResult {
+    override suspend fun includeProvider(provider: Provider): IncludeResult {
+        providersMutex.withLock {
+            return includeProviderRaw(provider)
+        }
+    }
+
+    private fun includeProviderRaw(provider: Provider): IncludeResult {
         synchronized(liveProviders) {
             if (liveProviders.size == maxNumbOfProviders) {
                 return IncludeResult.NOT_ENOUGH_SPACE
@@ -170,36 +178,40 @@ class LoadBalancerServiceImpl @Autowired constructor(private val config: LoadBal
         }
     }
 
-
-    override fun excludeProvider(provider: Provider): Boolean {
-        val removedFromLive = excludeProviderFromLive(provider)
-        synchronized(nonLiveProvidersSync) {
-            val removeFromBroken = brokenProviders.any { it.id == provider.id }
-            if (removeFromBroken) {
-                brokenProviders = brokenProviders.filter { it.id != provider.id }
-            }
-            val removedFromRecovered = recoveredProviders.any { it.id == provider.id }
-            if (removeFromBroken) {
-                recoveredProviders = recoveredProviders.filter { it.id != provider.id }
-            }
-
-            return removedFromLive || removeFromBroken || removedFromRecovered
+    override suspend fun excludeProvider(provider: Provider): Boolean {
+        providersMutex.withLock {
+            return excludeProviderRaw(provider)
         }
+    }
+
+    private fun excludeProviderRaw(provider: Provider): Boolean {
+        val removedFromLive = excludeProviderFromLive(provider)
+        val removeFromBroken = brokenProviders.any { it.id == provider.id }
+        if (removeFromBroken) {
+            brokenProviders = brokenProviders.filter { it.id != provider.id }
+        }
+        val removedFromRecovered = recoveredProviders.any { it.id == provider.id }
+        if (removeFromBroken) {
+            recoveredProviders = recoveredProviders.filter { it.id != provider.id }
+        }
+
+        return removedFromLive || removeFromBroken || removedFromRecovered
     }
 
 
     /**
+     * This method does not do any synchronization. For sake of speed,
+     * it returns the raw state as is (the state can be temporarily inconsistent).
+     *
      * @return the current state of the Load Balancer
      */
     override val state: LoadBalancerState
-        get() {
-            synchronized(nonLiveProvidersSync){
-                return LoadBalancerState(
-                        ongoingRequests = ongoingRequests.get(),
-                        liveProviders = liveProviders.map(Provider::id),
-                        brokenProviders = brokenProviders.map(Provider::id),
-                        recoveredProviders = recoveredProviders.map(Provider::id)
-                )
-            }
+        get()  {
+            return LoadBalancerState(
+                    ongoingRequests = ongoingRequests.get(),
+                    liveProviders = liveProviders.map(Provider::id),
+                    brokenProviders = brokenProviders.map(Provider::id),
+                    recoveredProviders = recoveredProviders.map(Provider::id)
+            )
         }
 }

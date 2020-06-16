@@ -21,12 +21,12 @@ interface LoadBalancerService {
     @Throws(TooManyRequestsException::class, NoProviderAvailableException::class)
     fun get(): String
 
-    fun includeProvider(provider: Provider): IncludeResult
+    suspend fun includeProvider(provider: Provider): IncludeResult
     /**
      * Excludes the provider from the list of Live Providers
      * @return true if the element has been successfully removed; false if it was not present in the Load Balancer
      */
-    fun excludeProvider(provider: Provider): Boolean
+    suspend fun excludeProvider(provider: Provider): Boolean
 
     val state: LoadBalancerState
 }
